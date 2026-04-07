@@ -1,19 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import requests
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 app = FastAPI(title="PowderLayer API")
 
-# Allow Lovable to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def home():
+    return {"status": "PowderLayer API is running and healthy"}
 
 class PowderLayerEngine:
     def __init__(self):
@@ -37,27 +39,65 @@ class PowderLayerEngine:
             return round(windchill, 1)
         return temp_c
 
-    def _fetch_weather(self, lat: float, lon: float, elevation: int) -> Dict:
+    def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
         url = "https://api.open-meteo.com/v1/forecast"
-        params = {"latitude": lat, "longitude": lon, "elevation": elevation, "current": "temperature_2m,wind_speed_10m", "timezone": "Europe/Zurich"}
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "elevation": elevation,
+            "timezone": "Europe/Zurich"
+        }
+
+        # If frontend sent a specific date and hour, use the hourly forecast
+        if target_date and target_hour is not None:
+            params["hourly"] = "temperature_2m,wind_speed_10m"
+            params["start_date"] = target_date
+            params["end_date"] = target_date
+        else:
+            # Otherwise, just get the weather right now
+            params["current"] = "temperature_2m,wind_speed_10m"
+
         try:
-            response = requests.get(url, params=params, timeout=5.0)
+            response = requests.get(url, params=params, timeout=10.0)
+            
+            # Catch Open-Meteo's specific 400 error (Usually caused by asking for dates > 14 days in future)
+            if response.status_code == 400:
+                raise HTTPException(status_code=400, detail="Date out of range. Weather forecast is only available for the next 14 days.")
+                
             response.raise_for_status()
             data = response.json()
-            temp = data["current"]["temperature_2m"]
-            wind = data["current"]["wind_speed_10m"]
+            
+            if "hourly" in data:
+                # Format target time to match Open-Meteo (e.g., "2026-04-07T07:00")
+                hour_str = f"{int(target_hour):02d}:00"
+                target_time = f"{target_date}T{hour_str}"
+                
+                try:
+                    time_index = data["hourly"]["time"].index(target_time)
+                    temp = data["hourly"]["temperature_2m"][time_index]
+                    wind = data["hourly"]["wind_speed_10m"][time_index]
+                except ValueError:
+                    # If exact hour isn't found, fallback safely to the first hour of that day
+                    temp = data["hourly"]["temperature_2m"][0]
+                    wind = data["hourly"]["wind_speed_10m"][0]
+            else:
+                temp = data["current"]["temperature_2m"]
+                wind = data["current"]["wind_speed_10m"]
+                
             return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
-        except Exception as e:
-            raise HTTPException(status_code=502, detail="Weather API unavailable")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"WEATHER API ERROR: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"Weather API unavailable: {str(e)}")
 
-    def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float) -> Dict:
+    def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
         normalized_resort = resort_name.strip().lower()
         resort = next((r for r in self.resorts if r["name"] == normalized_resort), None)
         if not resort:
             raise HTTPException(status_code=404, detail="Resort not found")
 
-        weather_base = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_base"])
-        weather_peak = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_peak"])
+        weather_base = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_base"], target_date, target_hour)
+        weather_peak = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_peak"], target_date, target_hour)
 
         base_required_clo = max(0.0, (31.0 - weather_peak["feels_like"]) * 0.05)
         multiplier = self.activity_multipliers.get(activity_level.strip().lower(), 1.0)
@@ -71,9 +111,10 @@ class PowderLayerEngine:
 
 engine = PowderLayerEngine()
 
+# The endpoint now explicitly accepts 'date' and 'hour'
 @app.get("/recommendation")
-def get_recommendation(resort_name: str, activity_level: str = "medium", user_offset: float = 0.0):
-    return engine.get_layering_recommendation(resort_name, activity_level, user_offset)
+def get_recommendation(resort_name: str, activity_level: str = "medium", user_offset: float = 0.0, date: Optional[str] = None, hour: Optional[int] = None):
+    return engine.get_layering_recommendation(resort_name, activity_level, user_offset, date, hour)
 
 @app.get("/feedback")
 def calculate_new_offset(current_offset: float, feedback: str):
