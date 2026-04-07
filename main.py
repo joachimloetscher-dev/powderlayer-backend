@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import math
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = FastAPI(title="PowderLayer API")
 
@@ -14,7 +14,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FIX 2: Added 'HEAD' so all bots get a polite answer ---
 @app.get("/")
 @app.head("/")
 def home():
@@ -42,20 +41,12 @@ class PowderLayerEngine:
             return round(windchill, 1)
         return temp_c
 
-    # --- FIX 1: The Date Bouncer ---
-    def _validate_date(self, target_date: Optional[str]):
-        if not target_date:
-            return
-        try:
-            req_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-            today = datetime.utcnow().date()
-            # If date is more than 14 days in the future, stop immediately!
-            if req_date > today + timedelta(days=14):
-                raise HTTPException(status_code=400, detail="Date too far in the future. We only support 14-day forecasts.")
-        except ValueError:
-            pass # If the date format is just weird, we let it pass to let Open-Meteo handle it
-
     def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
+        # TEST FIX: Set 'today' to Zurich time (UTC + 1 or +2) to avoid midnight boundary errors.
+        # Approximation using UTC+1 (standard) which is much safer than pure UTC.
+        zurich_tz = timezone(timedelta(hours=1))
+        today = datetime.now(zurich_tz).date()
+        
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
             "latitude": lat,
@@ -65,29 +56,60 @@ class PowderLayerEngine:
         }
 
         if target_date and target_hour is not None:
+            try:
+                clean_date = target_date.strip()
+                req_date = datetime.strptime(clean_date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format.")
+
+            # TEST FIX: Input sanitation for target_hour
+            safe_hour = max(0, min(23, int(target_hour)))
+
+            if req_date > today + timedelta(days=14):
+                raise HTTPException(status_code=400, detail="Forecast limit exceeded. Maximum 14 days in the future.")
+
+            if req_date < today - timedelta(days=365):
+                raise HTTPException(status_code=400, detail="Historical limit exceeded. Maximum 1 year in the past.")
+
+            # TEST FIX: The "Yesterday Gap". 
+            # Use Forecast API for recent past (last 90 days). Use Archive API for older dates.
+            if req_date < today - timedelta(days=90):
+                url = "https://archive-api.open-meteo.com/v1/archive"
+            else:
+                url = "https://api.open-meteo.com/v1/forecast"
+
             params["hourly"] = "temperature_2m,wind_speed_10m"
-            params["start_date"] = target_date
-            params["end_date"] = target_date
+            params["start_date"] = clean_date
+            params["end_date"] = clean_date
+
         else:
             params["current"] = "temperature_2m,wind_speed_10m"
+            safe_hour = None
 
         try:
             response = requests.get(url, params=params, timeout=10.0)
+            
             if response.status_code == 400:
-                raise HTTPException(status_code=400, detail="Open-Meteo rejected the request. Date may be out of range.")
+                try:
+                    error_data = response.json()
+                    reason = error_data.get("reason", "Weather data unavailable for this date.")
+                except Exception:
+                    reason = "Out of bounds."
+                raise HTTPException(status_code=400, detail=f"Weather unavailable: {reason}")
                 
             response.raise_for_status()
             data = response.json()
             
             if "hourly" in data:
-                hour_str = f"{int(target_hour):02d}:00"
-                target_time = f"{target_date}T{hour_str}"
+                hour_str = f"{safe_hour:02d}:00"
+                target_time = f"{clean_date}T{hour_str}"
                 
                 try:
                     time_index = data["hourly"]["time"].index(target_time)
                     temp = data["hourly"]["temperature_2m"][time_index]
                     wind = data["hourly"]["wind_speed_10m"][time_index]
                 except ValueError:
+                    # Safe fallback to index 0 instead of 12 to prevent OutOfBounds array errors
                     temp = data["hourly"]["temperature_2m"][0]
                     wind = data["hourly"]["wind_speed_10m"][0]
             else:
@@ -98,16 +120,13 @@ class PowderLayerEngine:
             
         except requests.exceptions.RequestException as e:
             print(f"WEATHER API ERROR: {str(e)}")
-            raise HTTPException(status_code=502, detail="Weather API disconnected or timed out.")
+            raise HTTPException(status_code=503, detail="Weather Server unreachable. Please try again.")
 
     def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
-        # Run the date bouncer first!
-        self._validate_date(target_date)
-
         normalized_resort = resort_name.strip().lower()
         resort = next((r for r in self.resorts if r["name"] == normalized_resort), None)
         if not resort:
-            raise HTTPException(status_code=404, detail="Resort not found")
+            raise HTTPException(status_code=404, detail="Ski Resort not found.")
 
         weather_base = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_base"], target_date, target_hour)
         weather_peak = self._fetch_weather(resort["lat"], resort["lon"], resort["alt_peak"], target_date, target_hour)
