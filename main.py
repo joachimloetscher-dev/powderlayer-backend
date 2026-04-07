@@ -84,20 +84,12 @@ class PowderLayerEngine:
             "User-Agent": "PowderLayerApp/2.0 (Contact: hello@powderlayer.com)"
         }
 
+        # --- PRIMARY ENGINE: OPEN-METEO ---
         try:
-            max_retries = 3
-            response = None
-            for attempt in range(max_retries):
-                response = requests.get(url, params=params, headers=headers, timeout=10.0)
-                if response.status_code == 200:
-                    break
-                if response.status_code in [502, 503, 504]:
-                    print(f"🔄 Open-Meteo Network Error. Retrying attempt {attempt+1} of {max_retries}...")
-                    time.sleep(1.0)
-                    continue
-                if response.status_code == 400:
-                    raise HTTPException(status_code=400, detail="Weather API rejected the date or parameters.")
-
+            response = requests.get(url, params=params, headers=headers, timeout=5.0)
+            if response.status_code == 400:
+                raise HTTPException(status_code=400, detail="Weather API rejected the parameters.")
+            
             response.raise_for_status()
             data = response.json()
             
@@ -115,33 +107,37 @@ class PowderLayerEngine:
                 temp = data["current"]["temperature_2m"]
                 wind = data["current"]["wind_speed_10m"]
                 
-            # --- LOGGING: NORMAL EXECUTION ---
-            print(f"✅ NORMAL EXECUTION: Successfully fetched weather data from {url}")
+            print(f"✅ PRIMARY SUCCESS: Open-Meteo processed the request.")
             return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
             
-        except requests.exceptions.RequestException as e:
-            print(f"❌ API ERROR: {str(e)}. Executing Emergency Fallback to Live Weather...")
-            if params.get("hourly"):
-                try:
-                    fallback_params = {
-                        "latitude": lat, "longitude": lon, "elevation": elevation, 
-                        "timezone": "Europe/Zurich", "current": "temperature_2m,wind_speed_10m"
-                    }
-                    fb_res = requests.get("https://api.open-meteo.com/v1/forecast", params=fallback_params, headers=headers, timeout=10.0)
-                    fb_res.raise_for_status()
-                    fb_data = fb_res.json()
-                    temp = fb_data["current"]["temperature_2m"]
-                    wind = fb_data["current"]["wind_speed_10m"]
-                    
-                    # --- LOGGING: FALLBACK EXECUTION ---
-                    print("⚠️ FALLBACK APPLIED: App saved from crash. Successfully fetched Live Current Weather instead.")
-                    return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
+        except Exception as e:
+            print(f"❌ OPEN-METEO BLOCKED US: {str(e)}")
+            print("⚠️ TRIGGERING SECONDARY ENGINE (MET NORWAY)...")
+            
+            # --- SECONDARY ENGINE: MET NORWAY (YR.NO) ---
+            try:
+                # MET Norway API requires altitude and a strict User-Agent
+                fb_url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+                fb_params = {"lat": lat, "lon": lon, "altitude": elevation}
+                fb_headers = {"User-Agent": "PowderLayer-SkiApp/2.0 github.com/powderlayer"}
                 
-                except Exception as fallback_e:
-                    print(f"💥 FALLBACK FAILED: {str(fallback_e)}")
-                    raise HTTPException(status_code=503, detail="Weather service completely offline.")
-            else:
-                raise HTTPException(status_code=503, detail="Weather service offline.")
+                fb_res = requests.get(fb_url, params=fb_params, headers=fb_headers, timeout=10.0)
+                fb_res.raise_for_status()
+                fb_data = fb_res.json()
+                
+                # Extract current temperature and wind
+                current_data = fb_data['properties']['timeseries'][0]['data']['instant']['details']
+                temp = current_data['air_temperature']
+                
+                # MET Norway returns wind in meters per second (m/s). We convert to km/h (* 3.6)
+                wind = current_data['wind_speed'] * 3.6
+                
+                print("✅ MET NORWAY FALLBACK SUCCESSFUL! App saved from crashing.")
+                return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
+                
+            except Exception as fb_error:
+                print(f"💥 FATAL ERROR: Both weather APIs failed. Details: {str(fb_error)}")
+                raise HTTPException(status_code=503, detail="All European weather services are offline. Please try again.")
 
     def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
         normalized_resort = resort_name.strip().lower()
