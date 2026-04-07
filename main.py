@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import math
+import time
 from typing import Dict, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -64,7 +65,6 @@ class PowderLayerEngine:
 
             if req_date > today + timedelta(days=14):
                 raise HTTPException(status_code=400, detail="Forecast limit exceeded. Maximum 14 days in the future.")
-
             if req_date < today - timedelta(days=365):
                 raise HTTPException(status_code=400, detail="Historical limit exceeded. Maximum 1 year in the past.")
 
@@ -76,29 +76,34 @@ class PowderLayerEngine:
             params["hourly"] = "temperature_2m,wind_speed_10m"
             params["start_date"] = clean_date
             params["end_date"] = clean_date
-
         else:
             params["current"] = "temperature_2m,wind_speed_10m"
             safe_hour = None
 
+        headers = {
+            "User-Agent": "PowderLayerApp/2.0 (Contact: hello@powderlayer.com)"
+        }
+
         try:
-            response = requests.get(url, params=params, timeout=10.0)
-            
-            if response.status_code == 400:
-                try:
-                    error_data = response.json()
-                    reason = error_data.get("reason", "Weather data unavailable for this date.")
-                except Exception:
-                    reason = "Out of bounds."
-                raise HTTPException(status_code=400, detail=f"Weather unavailable: {reason}")
-                
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                response = requests.get(url, params=params, headers=headers, timeout=10.0)
+                if response.status_code == 200:
+                    break
+                if response.status_code in [502, 503, 504]:
+                    print(f"🔄 Open-Meteo Network Error. Retrying attempt {attempt+1} of {max_retries}...")
+                    time.sleep(1.0)
+                    continue
+                if response.status_code == 400:
+                    raise HTTPException(status_code=400, detail="Weather API rejected the date or parameters.")
+
             response.raise_for_status()
             data = response.json()
             
             if "hourly" in data:
                 hour_str = f"{safe_hour:02d}:00"
                 target_time = f"{clean_date}T{hour_str}"
-                
                 try:
                     time_index = data["hourly"]["time"].index(target_time)
                     temp = data["hourly"]["temperature_2m"][time_index]
@@ -110,11 +115,33 @@ class PowderLayerEngine:
                 temp = data["current"]["temperature_2m"]
                 wind = data["current"]["wind_speed_10m"]
                 
+            # --- LOGGING: NORMAL EXECUTION ---
+            print(f"✅ NORMAL EXECUTION: Successfully fetched weather data from {url}")
             return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
             
         except requests.exceptions.RequestException as e:
-            print(f"WEATHER API ERROR: {str(e)}")
-            raise HTTPException(status_code=503, detail="Weather Server unreachable. Please try again.")
+            print(f"❌ API ERROR: {str(e)}. Executing Emergency Fallback to Live Weather...")
+            if params.get("hourly"):
+                try:
+                    fallback_params = {
+                        "latitude": lat, "longitude": lon, "elevation": elevation, 
+                        "timezone": "Europe/Zurich", "current": "temperature_2m,wind_speed_10m"
+                    }
+                    fb_res = requests.get("https://api.open-meteo.com/v1/forecast", params=fallback_params, headers=headers, timeout=10.0)
+                    fb_res.raise_for_status()
+                    fb_data = fb_res.json()
+                    temp = fb_data["current"]["temperature_2m"]
+                    wind = fb_data["current"]["wind_speed_10m"]
+                    
+                    # --- LOGGING: FALLBACK EXECUTION ---
+                    print("⚠️ FALLBACK APPLIED: App saved from crash. Successfully fetched Live Current Weather instead.")
+                    return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
+                
+                except Exception as fallback_e:
+                    print(f"💥 FALLBACK FAILED: {str(fallback_e)}")
+                    raise HTTPException(status_code=503, detail="Weather service completely offline.")
+            else:
+                raise HTTPException(status_code=503, detail="Weather service offline.")
 
     def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
         normalized_resort = resort_name.strip().lower()
