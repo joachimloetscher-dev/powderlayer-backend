@@ -21,7 +21,7 @@ def home():
 
 class PowderLayerEngine:
     def __init__(self):
-        self.resorts = [
+        self.resorts =[
             { "name": "zermatt", "lat": 46.02, "lon": 7.75, "alt_base": 1620, "alt_peak": 3883 },
             { "name": "st. moritz", "lat": 46.50, "lon": 9.84, "alt_base": 1735, "alt_peak": 3057 },
             { "name": "davos klosters", "lat": 46.80, "lon": 9.83, "alt_base": 1560, "alt_peak": 2844 },
@@ -41,44 +41,36 @@ class PowderLayerEngine:
             return round(windchill, 1)
         return temp_c
 
-def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
-        # --- DIAGNOSTIC LOGS START ---
-        print(f"--- DEBUG INFO ---")
-        print(f"1. Target Date Received: {target_date}")
-        
+    def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
         zurich_tz = timezone(timedelta(hours=1))
         today = datetime.now(zurich_tz).date()
-        print(f"2. Backend Server's 'Today' is: {today}")
-
+        
         url = "https://api.open-meteo.com/v1/forecast"
-        params = {"latitude": lat, "longitude": lon, "elevation": elevation, "timezone": "Europe/Zurich"}
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "elevation": elevation,
+            "timezone": "Europe/Zurich"
+        }
 
         if target_date and target_hour is not None:
             try:
                 clean_date = target_date.strip()
                 req_date = datetime.strptime(clean_date, "%Y-%m-%d").date()
-                print(f"3. Parsed Request Date: {req_date}")
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format.")
 
             safe_hour = max(0, min(23, int(target_hour)))
 
-            # RULE 1: Future Check
             if req_date > today + timedelta(days=14):
-                print("4. ACTION: Request Blocked! Date is too far in the future.")
                 raise HTTPException(status_code=400, detail="Forecast limit exceeded. Maximum 14 days in the future.")
 
-            # RULE 2: History Check
             if req_date < today - timedelta(days=365):
-                print("4. ACTION: Request Blocked! Date is too far in the past.")
                 raise HTTPException(status_code=400, detail="Historical limit exceeded. Maximum 1 year in the past.")
 
-            # RULE 3: Routing
             if req_date < today - timedelta(days=90):
-                print("4. ACTION: Routing to Archive API")
                 url = "https://archive-api.open-meteo.com/v1/archive"
             else:
-                print("4. ACTION: Routing to standard Forecast API")
                 url = "https://api.open-meteo.com/v1/forecast"
 
             params["hourly"] = "temperature_2m,wind_speed_10m"
@@ -86,19 +78,19 @@ def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Op
             params["end_date"] = clean_date
 
         else:
-            print("3. No target date provided. Fetching Live Weather.")
             params["current"] = "temperature_2m,wind_speed_10m"
             safe_hour = None
-
-        print(f"5. Sending Request to Open-Meteo URL: {url}")
-        # --- DIAGNOSTIC LOGS END ---
 
         try:
             response = requests.get(url, params=params, timeout=10.0)
             
             if response.status_code == 400:
-                print(f"API REJECTED IT: {response.text}") # Print exact API complaint
-                raise HTTPException(status_code=400, detail="Weather API rejected the parameters.")
+                try:
+                    error_data = response.json()
+                    reason = error_data.get("reason", "Weather data unavailable for this date.")
+                except Exception:
+                    reason = "Out of bounds."
+                raise HTTPException(status_code=400, detail=f"Weather unavailable: {reason}")
                 
             response.raise_for_status()
             data = response.json()
@@ -106,6 +98,7 @@ def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Op
             if "hourly" in data:
                 hour_str = f"{safe_hour:02d}:00"
                 target_time = f"{clean_date}T{hour_str}"
+                
                 try:
                     time_index = data["hourly"]["time"].index(target_time)
                     temp = data["hourly"]["temperature_2m"][time_index]
@@ -120,7 +113,7 @@ def _fetch_weather(self, lat: float, lon: float, elevation: int, target_date: Op
             return {"temp": temp, "wind": wind, "feels_like": self._calculate_windchill(temp, wind)}
             
         except requests.exceptions.RequestException as e:
-            print(f"CRITICAL WEATHER API ERROR: {str(e)}")
+            print(f"WEATHER API ERROR: {str(e)}")
             raise HTTPException(status_code=503, detail="Weather Server unreachable. Please try again.")
 
     def get_layering_recommendation(self, resort_name: str, activity_level: str, user_offset: float, target_date: Optional[str], target_hour: Optional[int]) -> Dict:
